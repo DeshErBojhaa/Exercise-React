@@ -1,26 +1,15 @@
-/// `InputCellId` is a unique identifier for an input cell.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InputCellId();
-/// `ComputeCellId` is a unique identifier for a compute cell.
-/// Values of type `InputCellId` and `ComputeCellId` should not be mutually assignable,
-/// demonstrated by the following tests:
-///
-/// ```compile_fail
-/// let mut r = react::Reactor::new();
-/// let input: react::ComputeCellId = r.create_input(111);
-/// ```
-///
-/// ```compile_fail
-/// let mut r = react::Reactor::new();
-/// let input = r.create_input(111);
-/// let compute: react::InputCellId = r.create_compute(&[react::CellId::Input(input)], |_| 222).unwrap();
-/// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ComputeCellId();
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CallbackId();
+use std::collections::HashMap;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ComputeCellId(usize);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CallbackId(usize);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct InputCellId(usize);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CellId {
     Input(InputCellId),
     Compute(ComputeCellId),
@@ -32,21 +21,42 @@ pub enum RemoveCallbackError {
     NonexistentCallback,
 }
 
-pub struct Reactor<T> {
-    // Just so that the compiler doesn't complain about an unused type parameter.
-    // You probably want to delete this field.
-    dummy: ::std::marker::PhantomData<T>,
+#[derive(Debug, PartialEq, Eq)]
+struct InputCell<T> {
+    val: T,
+    children: Vec<CellId>,
+}
+
+impl<T: Copy> InputCell<T> {
+    fn new(val: T, children: Vec<CellId>) -> Self {
+        Self { val, children }
+    }
+}
+
+struct ComputeCell<'a, T> {
+    val: T,
+    children: Vec<CellId>,
+    parents: Vec<CellId>,
+    callbacks: HashMap<CallbackId, Box<dyn FnMut(T)>>,
+    func: Box<dyn 'a + Fn(&[T]) -> T>,
+}
+
+pub struct Reactor<'a, T> {
+    inputs: HashMap<CellId, Box<InputCell<T>>>,
+    compute: HashMap<CellId, Box<ComputeCell<'a, T>>>,
 }
 
 // You are guaranteed that Reactor will only be tested against types that are Copy + PartialEq.
-impl<T: Copy + PartialEq> Reactor<T> {
+impl<'a, T: Copy + PartialEq> Reactor<'a, T> {
     pub fn new() -> Self {
-        todo!()
+        Self { inputs: HashMap::new(), compute: HashMap::new() }
     }
 
     // Creates an input cell with the specified initial value, returning its ID.
     pub fn create_input(&mut self, _initial: T) -> InputCellId {
-        todo!()
+        let id = InputCellId(self.inputs.len());
+        self.inputs.insert(CellId::Input(id), Box::new(InputCell::new(_initial,vec![])));
+        id
     }
 
     // Creates a compute cell with the specified dependencies and compute function.
@@ -62,12 +72,51 @@ impl<T: Copy + PartialEq> Reactor<T> {
     // Notice that there is no way to *remove* a cell.
     // This means that you may assume, without checking, that if the dependencies exist at creation
     // time they will continue to exist as long as the Reactor exists.
-    pub fn create_compute<F: Fn(&[T]) -> T>(
+    pub fn create_compute<F: Fn(&[T]) -> T + 'a>(
         &mut self,
         _dependencies: &[CellId],
         _compute_func: F,
     ) -> Result<ComputeCellId, CellId> {
-        todo!()
+        let mut values: Vec<T> = Vec::new();
+        for &d in _dependencies {
+            match d {
+                CellId::Input(_) => {
+                    if !self.inputs.contains_key(&d) {
+                        return Err(d);
+                    }
+                    let cell = self.inputs.get(&d).unwrap();
+                    values.push(cell.val);
+                }
+                CellId::Compute(_) => {
+                    if !self.compute.contains_key(&d) {
+                        return Err(d);
+                    }
+                    let cell = self.compute.get(&d).unwrap();
+                    values.push(cell.val);
+                }
+            }
+        }
+        let id = ComputeCellId(self.compute.len());
+        self.compute.insert(CellId::Compute(id), Box::new(ComputeCell {
+            val: _compute_func(&values),
+            parents: _dependencies.to_vec(),
+            children: Vec::new(),
+            callbacks: HashMap::new(),
+            func: Box::new(_compute_func),
+        }));
+        for d in _dependencies {
+            match d {
+                CellId::Input(_) => {
+                    let cell = self.inputs.get_mut(&d).unwrap();
+                    cell.children.push(CellId::Compute(id));
+                }
+                CellId::Compute(_) => {
+                    let cell = self.compute.get_mut(&d).unwrap();
+                    cell.children.push(CellId::Compute(id));
+                }
+            }
+        }
+        Ok(id)
     }
 
     // Retrieves the current value of the cell, or None if the cell does not exist.
@@ -78,7 +127,10 @@ impl<T: Copy + PartialEq> Reactor<T> {
     // It turns out this introduces a significant amount of extra complexity to this exercise.
     // We chose not to cover this here, since this exercise is probably enough work as-is.
     pub fn value(&self, id: CellId) -> Option<T> {
-        todo!("Get the value of the cell whose id is {id:?}")
+        match id {
+            CellId::Compute(_) => self.compute.get(&id).map(|c| c.val),
+            CellId::Input(_) => self.inputs.get(&id).map(|c| c.val)
+        }
     }
 
     // Sets the value of the specified input cell.
@@ -90,8 +142,57 @@ impl<T: Copy + PartialEq> Reactor<T> {
     //
     // As before, that turned out to add too much extra complexity.
     pub fn set_value(&mut self, _id: InputCellId, _new_value: T) -> bool {
-        todo!()
+        let _id = CellId::Input(_id);
+        if !self.inputs.contains_key(&_id) {
+            return false;
+        }
+        let mut children: Vec<CellId> = Vec::new();
+        if let Some(c) = self.inputs.get_mut(&_id) { 
+            c.val = _new_value;
+            for child in c.children.iter() {
+                children.push(*child);
+            }
+        }
+        for child in children {
+            self.update_compute_cell_value(&child);    
+        }
+        
+        true
     }
+
+    fn update_compute_cell_value(&mut self, id: &CellId) {
+        // Collect all parent values BEFORE mutably borrowing `self`
+        let parent_values: Vec<T> = self
+            .compute
+            .get(id)
+            .unwrap()
+            .parents
+            .iter()
+            .map(|par| self.value(*par).unwrap())
+            .collect();
+
+        // Now it's safe to mutate `self` since we no longer need immutable borrows
+        let cell = self.compute.get_mut(id).unwrap();
+        let new_val = (cell.func)(&parent_values);
+
+        if new_val != cell.val {
+            cell.val = new_val;
+
+            // Call the callbacks with the new value
+            for callback in cell.callbacks.values_mut() {
+                callback(cell.val);
+            }
+        }
+
+        // Collect child IDs to avoid borrow issues
+        let children: Vec<CellId> = cell.children.clone();
+        
+        // Now, it's safe to recursively update the children
+        for child in children {
+            self.update_compute_cell_value(&child);
+        }
+    }
+
 
     // Adds a callback to the specified compute cell.
     //
@@ -128,3 +229,5 @@ impl<T: Copy + PartialEq> Reactor<T> {
         )
     }
 }
+
+
