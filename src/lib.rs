@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ComputeCellId(usize);
@@ -37,8 +37,9 @@ struct ComputeCell<'a, T> {
     val: T,
     children: Vec<CellId>,
     parents: Vec<CellId>,
-    callbacks: HashMap<CallbackId, Box<dyn FnMut(T)>>,
+    callbacks: HashMap<CallbackId, Box<dyn 'a + FnMut(T)>>,
     func: Box<dyn 'a + Fn(&[T]) -> T>,
+    cb_id: usize
 }
 
 pub struct Reactor<'a, T> {
@@ -103,6 +104,7 @@ impl<'a, T: Copy + PartialEq> Reactor<'a, T> {
             children: Vec::new(),
             callbacks: HashMap::new(),
             func: Box::new(_compute_func),
+            cb_id: 1,
         }));
         for d in _dependencies {
             match d {
@@ -153,15 +155,22 @@ impl<'a, T: Copy + PartialEq> Reactor<'a, T> {
                 children.push(*child);
             }
         }
+        let mut callbacks_cells: HashSet<CellId> = HashSet::new();
         for child in children {
-            self.update_compute_cell_value(&child);    
+            self.update_compute_cell_value(&child, &mut callbacks_cells);    
+        }
+        
+        for id in callbacks_cells {
+            let cell = self.compute.get_mut(&id).unwrap();
+            for cb in cell.callbacks.values_mut() {
+                (cb)(cell.val);
+            }
         }
         
         true
     }
 
-    fn update_compute_cell_value(&mut self, id: &CellId) {
-        // Collect all parent values BEFORE mutably borrowing `self`
+    fn update_compute_cell_value(&mut self, id: &CellId, callbacks_cells: &mut HashSet<CellId>) {
         let parent_values: Vec<T> = self
             .compute
             .get(id)
@@ -177,19 +186,13 @@ impl<'a, T: Copy + PartialEq> Reactor<'a, T> {
 
         if new_val != cell.val {
             cell.val = new_val;
-
-            // Call the callbacks with the new value
-            for callback in cell.callbacks.values_mut() {
-                callback(cell.val);
-            }
+            callbacks_cells.insert(*id);
         }
-
-        // Collect child IDs to avoid borrow issues
+        
         let children: Vec<CellId> = cell.children.clone();
         
-        // Now, it's safe to recursively update the children
         for child in children {
-            self.update_compute_cell_value(&child);
+            self.update_compute_cell_value(&child, callbacks_cells);
         }
     }
 
@@ -206,12 +209,20 @@ impl<'a, T: Copy + PartialEq> Reactor<'a, T> {
     // * Exactly once if the compute cell's value changed as a result of the set_value call.
     //   The value passed to the callback should be the final value of the compute cell after the
     //   set_value call.
-    pub fn add_callback<F: FnMut(T)>(
+    pub fn add_callback<F: 'a + FnMut(T)>(
         &mut self,
         _id: ComputeCellId,
         _callback: F,
     ) -> Option<CallbackId> {
-        todo!()
+        match self.compute.get_mut(&CellId::Compute(_id)) {
+            None => None,
+            Some(cell) => {
+                let id = CallbackId(cell.cb_id);
+                cell.cb_id += 1;
+                cell.callbacks.insert(id, Box::new(_callback));
+                Some(id)
+            }
+        }
     }
 
     // Removes the specified callback, using an ID returned from add_callback.
@@ -224,9 +235,18 @@ impl<'a, T: Copy + PartialEq> Reactor<'a, T> {
         cell: ComputeCellId,
         callback: CallbackId,
     ) -> Result<(), RemoveCallbackError> {
-        todo!(
-            "Remove the callback identified by the CallbackId {callback:?} from the cell {cell:?}"
-        )
+        match self.compute.get_mut(&CellId::Compute(cell)) {
+            None => Err(RemoveCallbackError::NonexistentCell),
+            Some(cell) => {
+                match cell.callbacks.remove(&callback) {
+                    None => Err(RemoveCallbackError::NonexistentCallback),
+                    Some(_) => {
+                        cell.callbacks.remove(&callback);
+                        Ok(())
+                    }
+                }
+            }
+        }
     }
 }
 
